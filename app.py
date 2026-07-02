@@ -3,28 +3,33 @@
 숨고 SA 통합 리포트 성과 코멘트 생성기
 =====================================
 네이버/구글 x 요청/고수 4개 매체-유형 조합에 대해
-'일_매체_유형' 시트를 파싱하여 자동으로 성과 코멘트 초안을 생성하는 Streamlit 앱.
+RAW / RAW2 시트를 파싱하여 자동으로 성과 코멘트 초안을 생성하는 Streamlit 앱.
 
 사용법:
     streamlit run app.py
 
 입력:
     - 숨고 SA 통합 리포트 (.xlsb) 파일 1개
-    - 기준일(= '전일' 데이터 날짜)
+    - 기준일 (= '전일', 리포트 기준 가장 최신 일자)
+
+데이터 소스:
+    - RAW  시트: 매체 x 유형 단위 일자별 원본 데이터 (전체 탑라인 계산용)
+    - RAW2 시트: 매체 x 유형 x 카테고리1 x 카테고리2 x 서비스명 단위
+                 일자별 원본 데이터 (카테고리/서비스 상세 분석용, 숨김 시트)
+
+    기준일(전일)과 기준일-7일(전주 동요일) 두 날짜의 데이터를 실제 '날짜' 컬럼으로
+    직접 필터링하여 비교합니다. (기존 '일_매체_유형' 시트의 사전 계산된
+    전일/전주 스냅샷 대신, RAW/RAW2의 원본 일자 데이터를 기준으로 매번 재계산)
 
 출력:
     - 매체 x 유형 4종 각각에 대한 코멘트 초안 (텍스트, 다운로드 가능)
 
 주의:
-    - 이 앱은 '일_네이버_요청', '일_네이버_고수', '일_구글_요청', '일_구글_고수'
-      4개 시트의 고정된 헤더 구조(= 전일 / 전주 동요일 / gap / gap% 4블록,
-      cate1·cate2·서비스 단위 row)를 전제로 파싱합니다.
     - 키워드 레벨 데이터는 통합 리포트에 없으므로, 성과 변동폭이 큰 서비스에는
       '*키워드 성과 확인 필요' 문구를 자동으로 삽입합니다.
       (추후 네이버 검색광고 API 연동 시 이 부분을 실제 키워드 데이터로 대체 예정)
 """
 
-import io
 import tempfile
 from datetime import date, timedelta
 
@@ -37,34 +42,58 @@ from pyxlsb import open_workbook
 # 0. 설정값
 # ----------------------------------------------------------------------------
 
-SHEET_CONFIG = {
-    ("네이버", "요청"): "일_네이버_요청",
-    ("네이버", "고수"): "일_네이버_고수",
-    ("구글", "요청"): "일_구글_요청",
-    ("구글", "고수"): "일_구글_고수",
-}
-
-# '일_매체_유형' 시트의 metric 블록 순서 (헤더 row 기준 12개 metric x 4블록)
-METRIC_NAMES = [
-    "노출수", "클릭수", "광고비", "CTR", "CPC",
-    "AB_UA_요청", "AB_UA_고수", "AB_REQ", "AB_CAC", "CPR", "도달률", "CVR",
+MEDIA_TYPE_COMBOS = [
+    ("네이버", "요청"),
+    ("네이버", "고수"),
+    ("구글", "요청"),
+    ("구글", "고수"),
 ]
-BLOCK_NAMES = ["전일", "전주", "gap", "gap_pct"]
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
-# 데이터가 시작되는 행 (0-indexed). 헤더는 5번째 행(index 4)에 위치.
-HEADER_ROW_IDX = 4
-DATA_START_ROW_IDX = 5
+EXCEL_EPOCH = date(1899, 12, 30)  # 엑셀 날짜 시리얼 넘버 기준일 (1900 윤년 버그 보정 포함)
+
+RAW_SHEET_NAME = "RAW"
+RAW2_SHEET_NAME = "RAW2"
+
+# RAW 시트 숫자 컬럼
+RAW_NUMERIC_COLS = [
+    "노출", "클릭", "광고비", "UA", "REQ",
+    "UA_요청 (AB)", "UA_고수 (AB)", "REQ (AB)",
+    "결제고수 (AB)", "견적서발송 (AB)", "RR", "CAC", "CASH", "REWARD",
+]
+
+# RAW2 시트 숫자 컬럼
+RAW2_NUMERIC_COLS = [
+    "CAP", "노출", "클릭", "광고비",
+    "UA_요청 (AB)", "UA_고수 (AB)", "REQ (AB)", "UA", "REQ", "RR", "CASH", "REWARD",
+]
 
 
 # ----------------------------------------------------------------------------
-# 1. 파싱 함수
+# 1. 날짜 유틸
 # ----------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
-def load_workbook_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame | None:
-    """xlsb 파일 바이트에서 특정 시트를 읽어 정리된 DataFrame으로 반환."""
+def excel_serial_to_date(serial) -> date | None:
+    """엑셀 날짜 시리얼 넘버 -> python date. 값이 없으면 None."""
+    if serial is None or pd.isna(serial):
+        return None
+    return EXCEL_EPOCH + timedelta(days=int(serial))
+
+
+def date_to_excel_serial(d: date) -> int:
+    return (d - EXCEL_EPOCH).days
+
+
+def weekday_label(d: date) -> str:
+    return WEEKDAY_KR[d.weekday()]
+
+
+# ----------------------------------------------------------------------------
+# 2. 시트 로딩 (RAW / RAW2)
+# ----------------------------------------------------------------------------
+
+def _read_sheet_rows(file_bytes: bytes, sheet_name: str):
     with tempfile.NamedTemporaryFile(suffix=".xlsb", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -73,33 +102,70 @@ def load_workbook_sheet(file_bytes: bytes, sheet_name: str) -> pd.DataFrame | No
         if sheet_name not in wb.sheets:
             return None
         with wb.get_sheet(sheet_name) as sheet:
-            rows = list(sheet.rows())
+            return list(sheet.rows())
 
-    if len(rows) <= DATA_START_ROW_IDX:
+
+@st.cache_data(show_spinner=False)
+def load_raw_sheet(file_bytes: bytes) -> pd.DataFrame | None:
+    """RAW 시트: 매체 x 유형 단위 일자별 데이터. 탑라인(전체 합계) 계산에 사용."""
+    rows = _read_sheet_rows(file_bytes, RAW_SHEET_NAME)
+    if rows is None or len(rows) < 2:
         return None
 
-    cols = ["idx0", "cate1", "cate2", "서비스", "CAP"]
-    for block in BLOCK_NAMES:
-        for m in METRIC_NAMES:
-            cols.append(f"{block}_{m}")
-    cols.append("label")
+    header = [c.v for c in rows[0]]
+    data = [[c.v for c in r] for r in rows[1:]]
+    df = pd.DataFrame(data, columns=header)
 
-    data = []
-    for r in rows[DATA_START_ROW_IDX:]:
-        vals = [c.v for c in r]
-        if len(vals) < len(cols):
-            vals += [None] * (len(cols) - len(vals))
-        data.append(vals[: len(cols)])
+    df = df.dropna(subset=["매체", "유형", "날짜"]).reset_index(drop=True)
+    df["날짜_date"] = df["날짜"].apply(excel_serial_to_date)
 
-    df = pd.DataFrame(data, columns=cols)
-    df = df.dropna(subset=["서비스"]).reset_index(drop=True)
-
-    numeric_cols = [c for c in df.columns if c not in ("idx0", "cate1", "cate2", "서비스", "label")]
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in RAW_NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
 
+
+@st.cache_data(show_spinner=False)
+def load_raw2_sheet(file_bytes: bytes) -> pd.DataFrame | None:
+    """RAW2 시트: 매체 x 유형 x 카테고리1 x 카테고리2 x 서비스명 단위 일자별 데이터.
+    카테고리/서비스 상세 분석에 사용."""
+    rows = _read_sheet_rows(file_bytes, RAW2_SHEET_NAME)
+    if rows is None or len(rows) < 2:
+        return None
+
+    header = [c.v for c in rows[0]]
+    # 마지막 2개 컬럼처럼 헤더명이 None인 경우 임시 이름 부여
+    header = [h if h not in (None, "") else f"unnamed_{i}" for i, h in enumerate(header)]
+    data = [[c.v for c in r] for r in rows[1:]]
+    df = pd.DataFrame(data, columns=header)
+
+    df = df.rename(columns={
+        "카테고리1": "cate1",
+        "카테고리2": "cate2",
+        "서비스명": "서비스",
+    })
+
+    df = df.dropna(subset=["매체", "유형", "날짜"]).reset_index(drop=True)
+    df["날짜_date"] = df["날짜"].apply(excel_serial_to_date)
+
+    for c in RAW2_NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    return df
+
+
+def available_date_range(raw2_df: pd.DataFrame):
+    dates = raw2_df["날짜_date"].dropna()
+    if dates.empty:
+        return None, None
+    return dates.min(), dates.max()
+
+
+# ----------------------------------------------------------------------------
+# 3. 매체/유형/날짜 필터링 + 비교용 데이터프레임 생성
+# ----------------------------------------------------------------------------
 
 def pct_change(new: float, old: float):
     """old 대비 new 의 증감률. old가 0/NaN이면 None 반환."""
@@ -108,15 +174,18 @@ def pct_change(new: float, old: float):
     return (new - old) / old
 
 
-# ----------------------------------------------------------------------------
-# 2. 집계 함수
-# ----------------------------------------------------------------------------
+def compute_topline_from_raw(raw_df: pd.DataFrame, media: str, type_: str,
+                              base_date: date, prev_date: date) -> dict:
+    """RAW 시트 기준으로 기준일 vs 전주 동요일 탑라인 합계 계산."""
+    sub = raw_df[(raw_df["매체"] == media) & (raw_df["유형"] == type_)]
 
-def compute_topline(df: pd.DataFrame) -> dict:
-    ad_today = df["전일_광고비"].sum()
-    ad_prev = df["전주_광고비"].sum()
-    req_today = df["전일_AB_REQ"].sum()
-    req_prev = df["전주_AB_REQ"].sum()
+    today = sub[sub["날짜_date"] == base_date]
+    prev = sub[sub["날짜_date"] == prev_date]
+
+    ad_today = today["광고비"].sum()
+    ad_prev = prev["광고비"].sum()
+    req_today = today["REQ (AB)"].sum()
+    req_prev = prev["REQ (AB)"].sum()
 
     cpr_today = ad_today / req_today if req_today else None
     cpr_prev = ad_prev / req_prev if req_prev else None
@@ -128,8 +197,49 @@ def compute_topline(df: pd.DataFrame) -> dict:
         "ad_gap_pct": pct_change(ad_today, ad_prev),
         "req_gap_pct": pct_change(req_today, req_prev),
         "cpr_gap_pct": pct_change(cpr_today, cpr_prev),
+        "today_has_data": not today.empty,
+        "prev_has_data": not prev.empty,
     }
 
+
+def build_compat_df(raw2_df: pd.DataFrame, media: str, type_: str,
+                     base_date: date, prev_date: date) -> pd.DataFrame:
+    """RAW2에서 기준일/전주 동요일 두 날짜를 cate1/cate2/서비스 단위로 집계 후 병합.
+    이후 집계 로직(cate1_summary, cate2_summary, service_detail 등)이 기대하는
+    '전일_광고비', '전주_광고비', '전일_AB_REQ', '전주_AB_REQ', '전일_CPR', '전주_CPR'
+    컬럼 구조를 그대로 생성한다."""
+    sub = raw2_df[(raw2_df["매체"] == media) & (raw2_df["유형"] == type_)]
+
+    today = sub[sub["날짜_date"] == base_date]
+    prev = sub[sub["날짜_date"] == prev_date]
+
+    group_cols = ["cate1", "cate2", "서비스"]
+
+    today_g = today.groupby(group_cols, dropna=False).agg(
+        전일_광고비=("광고비", "sum"),
+        전일_AB_REQ=("REQ (AB)", "sum"),
+    ).reset_index()
+
+    prev_g = prev.groupby(group_cols, dropna=False).agg(
+        전주_광고비=("광고비", "sum"),
+        전주_AB_REQ=("REQ (AB)", "sum"),
+    ).reset_index()
+
+    merged = pd.merge(today_g, prev_g, on=group_cols, how="outer")
+    for c in ["전일_광고비", "전일_AB_REQ", "전주_광고비", "전주_AB_REQ"]:
+        merged[c] = merged[c].fillna(0)
+
+    merged["전일_CPR"] = merged.apply(
+        lambda r: (r["전일_광고비"] / r["전일_AB_REQ"]) if r["전일_AB_REQ"] else None, axis=1)
+    merged["전주_CPR"] = merged.apply(
+        lambda r: (r["전주_광고비"] / r["전주_AB_REQ"]) if r["전주_AB_REQ"] else None, axis=1)
+
+    return merged
+
+
+# ----------------------------------------------------------------------------
+# 4. 집계 함수 (카테고리1 / 카테고리2 / 서비스)
+# ----------------------------------------------------------------------------
 
 def cate1_summary(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("cate1").agg(
@@ -177,7 +287,7 @@ def service_detail(df: pd.DataFrame, cate2: str) -> pd.DataFrame:
 
 
 def select_top_cate2(cate2_df: pd.DataFrame, top_n: int, min_req_volume: int) -> pd.DataFrame:
-    """전주 REQ가 min_req_volume 이상인 cate2 중, REQ 절대 변동폭이 큰 순으로 top_n개 선정."""
+    """전주 혹은 전일 REQ가 min_req_volume 이상인 cate2 중, REQ 절대 변동폭이 큰 순으로 top_n개 선정."""
     filtered = cate2_df[
         (cate2_df["REQ_전주"].fillna(0) >= min_req_volume)
         | (cate2_df["REQ_전일"].fillna(0) >= min_req_volume)
@@ -194,7 +304,7 @@ def needs_keyword_check(req_gap_pct, req_today, req_prev, threshold: float, min_
 
 
 # ----------------------------------------------------------------------------
-# 3. 포맷 헬퍼
+# 5. 포맷 헬퍼
 # ----------------------------------------------------------------------------
 
 def fmt_money_man(won) -> str:
@@ -225,16 +335,20 @@ def fmt_int(x) -> str:
         return "0"
     return f"{x:,.0f}"
 
-def weekday_label(d: date) -> str:
-    return WEEKDAY_KR[d.weekday()]
-
 
 # ----------------------------------------------------------------------------
-# 4. 코멘트 생성
+# 6. 코멘트 생성
 # ----------------------------------------------------------------------------
 
-def build_topline_line(base_date: date, topline: dict) -> str:
+def build_topline_line(base_date: date, prev_date: date, topline: dict) -> str:
     date_str = f"{base_date.month}/{base_date.day}({weekday_label(base_date)})"
+
+    warnings = []
+    if not topline["today_has_data"]:
+        warnings.append(f"⚠ {base_date.isoformat()}(기준일) 데이터가 RAW 시트에 없습니다.")
+    if not topline["prev_has_data"]:
+        warnings.append(f"⚠ {prev_date.isoformat()}(전주 동요일) 데이터가 RAW 시트에 없습니다.")
+
     ad_str = fmt_money_man(topline["ad_today"])
     cpr_str = fmt_cpr_range(topline["cpr_today"])
     cpr_change = fmt_pct_directional(topline["cpr_gap_pct"], up_word="상승", down_word="하락")
@@ -243,8 +357,11 @@ def build_topline_line(base_date: date, topline: dict) -> str:
     req_change = fmt_pct_directional(topline["req_gap_pct"])
 
     line1 = f"{date_str} 광고비 {ad_str} 소진. REQ {req_str}건, CPR {cpr_str} (전주 동요일 대비 CPR {cpr_change})"
-    line2 = f"- 전주 동요일 대비 광고비 {ad_change}, REQ {req_change}"
-    return line1 + "\n" + line2
+    line2 = f"- 전주 동요일({prev_date.month}/{prev_date.day}) 대비 광고비 {ad_change}, REQ {req_change}"
+
+    lines = [line1, line2]
+    lines.extend(warnings)
+    return "\n".join(lines)
 
 
 def build_cate2_block(row, cate1_row, service_df, kw_threshold: float, kw_min_req: int, top_services: int) -> str:
@@ -290,15 +407,22 @@ def build_cate2_block(row, cate1_row, service_df, kw_threshold: float, kw_min_re
     return "\n".join(lines)
 
 
-def generate_comment(media: str, type_: str, base_date: date, df: pd.DataFrame,
+def generate_comment(media: str, type_: str, base_date: date, prev_date: date,
+                      raw_df: pd.DataFrame, raw2_df: pd.DataFrame,
                       top_n_cate2: int, top_n_service: int,
                       min_req_volume: int, kw_threshold: float, kw_min_req: int) -> str:
-    topline = compute_topline(df)
-    c1 = cate1_summary(df)
-    c2 = cate2_summary(df)
+    topline = compute_topline_from_raw(raw_df, media, type_, base_date, prev_date)
+    compat_df = build_compat_df(raw2_df, media, type_, base_date, prev_date)
 
     header = f"[{media} / {type_}]\n"
-    body = [header + build_topline_line(base_date, topline)]
+    body = [header + build_topline_line(base_date, prev_date, topline)]
+
+    if compat_df.empty:
+        body.append("\n(RAW2 시트에서 해당 매체/유형/날짜 조합의 카테고리 데이터를 찾을 수 없습니다.)")
+        return "\n".join(body)
+
+    c1 = cate1_summary(compat_df)
+    c2 = cate2_summary(compat_df)
 
     top_cate2 = select_top_cate2(c2, top_n_cate2, min_req_volume)
 
@@ -308,7 +432,7 @@ def generate_comment(media: str, type_: str, base_date: date, df: pd.DataFrame,
         for _, row in top_cate2.iterrows():
             cate1_row = c1[c1["cate1"] == row["cate1"]]
             cate1_row = cate1_row.iloc[0] if not cate1_row.empty else None
-            svc_df = service_detail(df, row["cate2"])
+            svc_df = service_detail(compat_df, row["cate2"])
             block = build_cate2_block(row, cate1_row, svc_df, kw_threshold, kw_min_req, top_n_service)
             body.append("\n" + block)
 
@@ -322,20 +446,25 @@ def generate_comment(media: str, type_: str, base_date: date, df: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------------
-# 5. Streamlit UI
+# 7. Streamlit UI
 # ----------------------------------------------------------------------------
 
 def main():
     st.set_page_config(page_title="숨고 SA 성과 코멘트 생성기", layout="wide")
     st.title("📊 숨고 SA 통합 리포트 → 성과 코멘트 생성기")
-    st.caption("네이버·구글 x 요청·고수 4개 매체-유형 조합에 대한 일간 성과 코멘트 초안을 자동 생성합니다.")
+    st.caption(
+        "RAW(매체x유형 일자별) / RAW2(카테고리·서비스 일자별) 시트를 기준으로, "
+        "기준일(전일)과 기준일-7일(전주 동요일)을 비교하여 성과 코멘트 초안을 자동 생성합니다."
+    )
 
     with st.sidebar:
         st.header("⚙️ 설정")
         uploaded_file = st.file_uploader("숨고 SA 통합 리포트 업로드 (.xlsb)", type=["xlsb"])
 
         default_base_date = date.today() - timedelta(days=1)
-        base_date = st.date_input("기준일 (= '전일' 데이터 날짜)", value=default_base_date)
+        base_date = st.date_input("기준일 (= 리포트 기준 가장 최신 일자, '전일')", value=default_base_date)
+        prev_date = base_date - timedelta(days=7)
+        st.caption(f"→ 전주 동요일: **{prev_date.isoformat()} ({weekday_label(prev_date)})** 로 자동 계산됩니다.")
 
         st.divider()
         st.subheader("코멘트 상세 옵션")
@@ -354,26 +483,44 @@ def main():
         st.info("왼쪽에서 통합 리포트(.xlsb) 파일을 업로드해주세요.")
         return
 
+    file_bytes = uploaded_file.getvalue()
+
+    with st.spinner("RAW / RAW2 시트 로딩 중..."):
+        raw_df = load_raw_sheet(file_bytes)
+        raw2_df = load_raw2_sheet(file_bytes)
+
+    if raw_df is None:
+        st.error(f"'{RAW_SHEET_NAME}' 시트를 찾을 수 없습니다. 파일 구조를 확인해주세요.")
+        return
+    if raw2_df is None:
+        st.error(f"'{RAW2_SHEET_NAME}' 시트를 찾을 수 없습니다. 숨김 시트가 포함된 원본 파일을 업로드해주세요.")
+        return
+
+    min_d, max_d = available_date_range(raw2_df)
+    if min_d and max_d:
+        st.caption(f"RAW2 시트 내 데이터 범위: {min_d.isoformat()} ~ {max_d.isoformat()}")
+        if base_date > max_d or base_date < min_d:
+            st.warning(
+                f"선택한 기준일({base_date.isoformat()})이 RAW2 데이터 범위를 벗어납니다. "
+                "카테고리/서비스 상세 분석이 비어있을 수 있습니다."
+            )
+        if prev_date < min_d:
+            st.warning(
+                f"전주 동요일({prev_date.isoformat()})이 RAW2 데이터 범위 이전입니다. "
+                "월초 리포트의 경우 RAW2에 전월 데이터가 없어 카테고리/서비스 비교가 제한될 수 있습니다."
+            )
+
     if not generate_btn:
         st.info("옵션을 확인한 뒤 '코멘트 생성' 버튼을 눌러주세요.")
         return
 
-    file_bytes = uploaded_file.getvalue()
-
-    tabs = st.tabs([f"{media} · {type_}" for (media, type_) in SHEET_CONFIG.keys()])
+    tabs = st.tabs([f"{media} · {type_}" for (media, type_) in MEDIA_TYPE_COMBOS])
     all_comments = []
 
-    for tab, ((media, type_), sheet_name) in zip(tabs, SHEET_CONFIG.items()):
+    for tab, (media, type_) in zip(tabs, MEDIA_TYPE_COMBOS):
         with tab:
-            with st.spinner(f"{sheet_name} 시트 분석 중..."):
-                df = load_workbook_sheet(file_bytes, sheet_name)
-
-            if df is None or df.empty:
-                st.warning(f"'{sheet_name}' 시트를 찾을 수 없거나 데이터가 없습니다.")
-                continue
-
             comment = generate_comment(
-                media, type_, base_date, df,
+                media, type_, base_date, prev_date, raw_df, raw2_df,
                 top_n_cate2=top_n_cate2,
                 top_n_service=top_n_service,
                 min_req_volume=min_req_volume,
@@ -391,8 +538,9 @@ def main():
                 key=f"download_{media}_{type_}",
             )
 
-            with st.expander("원본 데이터 미리보기"):
-                st.dataframe(df.head(20))
+            with st.expander("카테고리/서비스 원본 비교 데이터 미리보기 (RAW2 기준)"):
+                preview = build_compat_df(raw2_df, media, type_, base_date, prev_date)
+                st.dataframe(preview.sort_values("전일_광고비", ascending=False).head(30))
 
     if all_comments:
         st.divider()
